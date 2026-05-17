@@ -73,6 +73,14 @@ CONFIG_HEADER='# gstack configuration — edit freely, changes take effect on ne
 #                           # Set to true once the privacy gate has asked the user.
 #                           # Flip back to false to be re-prompted.
 #
+# ─── AI provider ─────────────────────────────────────────────────────
+# terminal_provider: claude # claude | codex
+#                           # Selects the CLI launched in the gstack browser
+#                           # Terminal pane. Codex uses your local Codex CLI
+#                           # subscription login; Claude remains the default.
+# codex_command:            # Optional override, e.g. npx -y @openai/codex
+# claude_command:           # Optional override, e.g. /opt/homebrew/bin/claude
+#
 # ─── Advanced ────────────────────────────────────────────────────────
 # codex_reviews: enabled    # disabled = skip Codex adversarial reviews in /ship
 # gstack_contributor: false # true = file field reports when gstack misbehaves
@@ -100,6 +108,9 @@ lookup_default() {
     skill_prefix) echo "false" ;;
     checkpoint_mode) echo "explicit" ;;
     checkpoint_push) echo "false" ;;
+    terminal_provider) echo "claude" ;;
+    codex_command) echo "" ;;
+    claude_command) echo "" ;;
     codex_reviews) echo "enabled" ;;
     gstack_contributor) echo "false" ;;
     skip_eng_review) echo "false" ;;
@@ -111,6 +122,11 @@ lookup_default() {
   esac
 }
 
+read_config_value() {
+  local key="$1"
+  grep -E "^${key}:" "$CONFIG_FILE" 2>/dev/null     | tail -1     | sed -E "s/^${key}:[[:space:]]*//; s/[[:space:]]+$//"     || true
+}
+
 case "${1:-}" in
   get)
     KEY="${2:?Usage: gstack-config get <key>}"
@@ -119,7 +135,7 @@ case "${1:-}" in
       echo "Error: key must contain only alphanumeric characters and underscores" >&2
       exit 1
     fi
-    VALUE=$(grep -E "^${KEY}:" "$CONFIG_FILE" 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '[:space:]' || true)
+    VALUE=$(read_config_value "$KEY")
     if [ -z "$VALUE" ]; then
       VALUE=$(lookup_default "$KEY")
     fi
@@ -141,6 +157,10 @@ case "${1:-}" in
     if [ "$KEY" = "artifacts_sync_mode" ] && [ "$VALUE" != "off" ] && [ "$VALUE" != "artifacts-only" ] && [ "$VALUE" != "full" ]; then
       echo "Warning: artifacts_sync_mode '$VALUE' not recognized. Valid values: off, artifacts-only, full. Using off." >&2
       VALUE="off"
+    fi
+    if [ "$KEY" = "terminal_provider" ] && [ "$VALUE" != "claude" ] && [ "$VALUE" != "codex" ]; then
+      echo "Warning: terminal_provider '$VALUE' not recognized. Valid values: claude, codex. Using claude." >&2
+      VALUE="claude"
     fi
     mkdir -p "$STATE_DIR"
     # Write annotated header on first creation
@@ -169,10 +189,11 @@ case "${1:-}" in
     echo ""
     echo "# ─── Active values (including defaults for unset keys) ───"
     for KEY in proactive routing_declined telemetry auto_upgrade update_check \
-               skill_prefix checkpoint_mode checkpoint_push codex_reviews \
-               gstack_contributor skip_eng_review workspace_root \
-               artifacts_sync_mode artifacts_sync_mode_prompted; do
-      VALUE=$(grep -E "^${KEY}:" "$CONFIG_FILE" 2>/dev/null | tail -1 | awk '{print $2}' | tr -d '[:space:]' || true)
+               skill_prefix checkpoint_mode checkpoint_push terminal_provider \
+               codex_command claude_command codex_reviews gstack_contributor \
+               skip_eng_review workspace_root artifacts_sync_mode \
+               artifacts_sync_mode_prompted; do
+      VALUE=$(read_config_value "$KEY")
       SOURCE="default"
       if [ -n "$VALUE" ]; then
         SOURCE="set"
@@ -185,9 +206,10 @@ case "${1:-}" in
   defaults)
     echo "# gstack-config defaults"
     for KEY in proactive routing_declined telemetry auto_upgrade update_check \
-               skill_prefix checkpoint_mode checkpoint_push codex_reviews \
-               gstack_contributor skip_eng_review workspace_root \
-               artifacts_sync_mode artifacts_sync_mode_prompted; do
+               skill_prefix checkpoint_mode checkpoint_push terminal_provider \
+               codex_command claude_command codex_reviews gstack_contributor \
+               skip_eng_review workspace_root artifacts_sync_mode \
+               artifacts_sync_mode_prompted; do
       printf '  %-24s %s\n' "$KEY:" "$(lookup_default "$KEY")"
     done
     ;;

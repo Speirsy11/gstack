@@ -142,18 +142,18 @@ describe('Source-level guard: terminal-agent', () => {
     expect(wsHandler).toContain('acceptedProtocol');
   });
 
-  test('lazy spawn: claude PTY is spawned in message handler, not on upgrade', () => {
+  test('lazy spawn: provider PTY is spawned in message handler, not on upgrade', () => {
     // The whole point of lazy-spawn (codex finding #8) is that the WS
-    // upgrade itself does NOT call spawnClaude. Spawn happens on first
+    // upgrade itself does NOT call spawnProvider. Spawn happens on first
     // message frame.
     const upgradeBlock = AGENT_SRC.slice(
       AGENT_SRC.indexOf("if (url.pathname === '/ws')"),
       AGENT_SRC.indexOf("websocket: {"),
     );
-    expect(upgradeBlock).not.toContain('spawnClaude(');
+    expect(upgradeBlock).not.toContain('spawnProvider(');
     // Spawn must be invoked from the message handler (lazy on first byte).
     const messageHandler = AGENT_SRC.slice(AGENT_SRC.indexOf('message(ws, raw)'));
-    expect(messageHandler).toContain('spawnClaude(');
+    expect(messageHandler).toContain('spawnProvider(');
     expect(messageHandler).toContain('!session.spawned');
   });
 
@@ -185,19 +185,27 @@ describe('Source-level guard: terminal-agent', () => {
     expect(fn).toContain("startsWith('chrome-extension://')");
   });
 
-  test('claude is spawned with --append-system-prompt tab-awareness hint', () => {
+  test('terminal agent supports Claude Code and Codex CLI providers', () => {
+    expect(AGENT_SRC).toContain("type TerminalProvider = 'claude' | 'codex'");
+    expect(AGENT_SRC).toContain("readGstackConfigValue('terminal_provider')");
+    expect(AGENT_SRC).toContain("readGstackConfigValue('codex_command')");
+    expect(AGENT_SRC).toContain("'npx', '-y', '@openai/codex'");
+    expect(AGENT_SRC).toContain("url.pathname === '/terminal-provider'");
+  });
+
+  test('Claude keeps --append-system-prompt tab-awareness hint', () => {
     expect(AGENT_SRC).toContain('function buildTabAwarenessHint');
     const hint = AGENT_SRC.slice(AGENT_SRC.indexOf('function buildTabAwarenessHint'));
     // The hint must mention the live state files and the fanout command —
-    // those are the two affordances that distinguish a gstack-PTY claude
-    // from a plain `claude` session.
+    // those are the two affordances that distinguish a gstack PTY session
+    // from a plain provider session.
     expect(hint).toContain('tabs.json');
     expect(hint).toContain('active-tab.json');
     expect(hint).toContain('tab-each');
-    // And it must be passed via --append-system-prompt at spawn time
-    // (NOT written into the PTY as user input — that would pollute the
-    // visible transcript).
-    const spawn = AGENT_SRC.slice(AGENT_SRC.indexOf('function spawnClaude'));
+    // Claude receives it through --append-system-prompt; Codex keeps the
+    // normal interactive CLI path without a fake user-input preamble.
+    const spawn = AGENT_SRC.slice(AGENT_SRC.indexOf('function spawnProvider'));
+    expect(spawn).toContain("provider.id === 'claude'");
     expect(spawn).toContain("'--append-system-prompt'");
     expect(spawn).toContain('tabHint');
   });

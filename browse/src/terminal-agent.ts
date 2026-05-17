@@ -1,5 +1,5 @@
 /**
- * Terminal Agent — PTY-backed Claude Code terminal for the gstack browser
+ * Terminal Agent — PTY-backed AI coding terminal for the gstack browser
  * sidebar. Translates the phoenix gbrowser PTY (cmd/gbd/terminal.go) into
  * Bun, with a few changes informed by codex's outside-voice review:
  *
@@ -11,8 +11,8 @@
  *    target.
  *  - Cookie-based auth via /internal/grant from the parent server, not a
  *    token in /health.
- *  - Lazy spawn: claude PTY is not spawned until the WS receives its first
- *    data frame. Sidebar opens that never type don't burn a claude session.
+ *  - Lazy spawn: provider PTY is not spawned until the WS receives its first
+ *    data frame. Sidebar opens that never type don't burn a provider session.
  *  - PTY dies with WS close (one PTY per WS). v1.1 may add session
  *    survival; for v1 we match phoenix's lifecycle.
  *
@@ -46,6 +46,17 @@ process.on('unhandledRejection', (reason) => {
   console.error('[terminal-agent] unhandledRejection:', reason);
 });
 
+type TerminalProvider = 'claude' | 'codex';
+
+interface ProviderSpec {
+  id: TerminalProvider;
+  label: string;
+  binaryName: string;
+  command: string[];
+  installUrl: string;
+  notFoundCode: string;
+}
+
 interface PtySession {
   proc: any | null;        // Bun.Subprocess once spawned
   cols: number;
@@ -56,24 +67,41 @@ interface PtySession {
 
 const sessions = new WeakMap<any, PtySession>(); // ws -> session
 
-/** Find claude on PATH. */
-function findClaude(): string | null {
-  // Test-only override. Lets the integration tests spawn /bin/bash instead
-  // of requiring claude to be installed on every CI runner. NEVER read in
-  // production (sidebar UI). Documented in browse/test/terminal-agent-integration.test.ts.
-  const override = process.env.BROWSE_TERMINAL_BINARY;
-  if (override && fs.existsSync(override)) return override;
-  // Bun.which is sync and respects PATH. Falls back to a small list of
-  // common install locations if PATH is stripped (e.g., launched from
-  // Conductor with a minimal env).
-  const which = (Bun as any).which?.('claude');
-  if (which) return which;
+function readGstackConfigValue(key: string): string | null {
+  const home = process.env.GSTACK_HOME || process.env.GSTACK_STATE_DIR || path.join(process.env.HOME || '', '.gstack');
+  const file = path.join(home, 'config.yaml');
+  try {
+    const raw = fs.readFileSync(file, 'utf-8');
+    let value: string | null = null;
+    for (const line of raw.split(/\r?\n/)) {
+      const match = line.match(new RegExp(`^${key}:\\s*(.*)$`));
+      if (match) value = match[1].trim();
+    }
+    return value || null;
+  } catch { return null; }
+}
+
+function getTerminalProvider(): TerminalProvider {
+  const raw = (process.env.BROWSE_TERMINAL_PROVIDER || readGstackConfigValue('terminal_provider') || 'claude').toLowerCase();
+  return raw === 'codex' ? 'codex' : 'claude';
+}
+
+function splitCommand(command: string): string[] {
+  // Small shell-like splitter for env/config commands such as
+  // "npx -y @openai/codex". It intentionally does not expand variables.
+  const parts = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+  return parts.map(p => p.replace(/^(['"])(.*)\1$/, '$2'));
+}
+
+function which(binary: string): string | null {
+  const found = (Bun as any).which?.(binary);
+  if (found) return found;
   const candidates = [
-    '/opt/homebrew/bin/claude',
-    '/usr/local/bin/claude',
-    `${process.env.HOME}/.local/bin/claude`,
-    `${process.env.HOME}/.bun/bin/claude`,
-    `${process.env.HOME}/.npm-global/bin/claude`,
+    `/opt/homebrew/bin/${binary}`,
+    `/usr/local/bin/${binary}`,
+    `${process.env.HOME}/.local/bin/${binary}`,
+    `${process.env.HOME}/.bun/bin/${binary}`,
+    `${process.env.HOME}/.npm-global/bin/${binary}`,
   ];
   for (const c of candidates) {
     try { fs.accessSync(c, fs.constants.X_OK); return c; } catch {}
@@ -81,19 +109,78 @@ function findClaude(): string | null {
   return null;
 }
 
-/** Probe + persist claude availability for the bootstrap card. */
-function writeClaudeAvailable(): void {
+function commandAvailable(command: string[]): boolean {
+  if (!command.length) return false;
+  if (command[0].includes('/')) {
+    try { fs.accessSync(command[0], fs.constants.X_OK); return true; } catch { return false; }
+  }
+  return !!which(command[0]);
+}
+
+function providerSpec(provider = getTerminalProvider()): ProviderSpec {
+  // Test-only override. Lets integration tests spawn /bin/bash instead of
+  // requiring a real AI CLI on every CI runner.
+  const override = process.env.BROWSE_TERMINAL_BINARY;
+  if (override && fs.existsSync(override)) {
+    return {
+      id: provider,
+      label: provider === 'codex' ? 'Codex CLI' : 'Claude Code',
+      binaryName: path.basename(override),
+      command: [override],
+      installUrl: provider === 'codex' ? 'https://github.com/openai/codex' : 'https://docs.anthropic.com/en/docs/claude-code',
+      notFoundCode: provider === 'codex' ? 'CODEX_NOT_FOUND' : 'CLAUDE_NOT_FOUND',
+    };
+  }
+
+  if (provider === 'codex') {
+    const configured = process.env.BROWSE_CODEX_COMMAND || readGstackConfigValue('codex_command');
+    let command = configured ? splitCommand(configured) : [];
+    if (!command.length) {
+      const codex = which('codex');
+      if (codex) command = [codex];
+      else {
+        const npx = which('npx');
+        command = npx ? [npx, '-y', '@openai/codex'] : ['npx', '-y', '@openai/codex'];
+      }
+    }
+    return {
+      id: 'codex',
+      label: 'Codex CLI',
+      binaryName: command[0] || 'codex',
+      command,
+      installUrl: 'https://github.com/openai/codex',
+      notFoundCode: 'CODEX_NOT_FOUND',
+    };
+  }
+
+  const configured = process.env.BROWSE_CLAUDE_COMMAND || readGstackConfigValue('claude_command');
+  const command = configured ? splitCommand(configured) : [which('claude') || 'claude'];
+  return {
+    id: 'claude',
+    label: 'Claude Code',
+    binaryName: command[0] || 'claude',
+    command,
+    installUrl: 'https://docs.anthropic.com/en/docs/claude-code',
+    notFoundCode: 'CLAUDE_NOT_FOUND',
+  };
+}
+
+/** Probe + persist selected provider availability for the bootstrap card. */
+function writeProviderAvailable(): void {
   const stateDir = path.dirname(STATE_FILE);
   try { mkdirSecure(stateDir); } catch {}
-  const found = findClaude();
+  const provider = providerSpec();
+  const available = commandAvailable(provider.command);
   const status = {
-    available: !!found,
-    path: found || undefined,
-    install_url: 'https://docs.anthropic.com/en/docs/claude-code',
+    provider: provider.id,
+    label: provider.label,
+    available,
+    path: available ? provider.command.join(' ') : undefined,
+    install_url: provider.installUrl,
     checked_at: new Date().toISOString(),
   };
-  const target = path.join(stateDir, 'claude-available.json');
-  const tmp = path.join(stateDir, `.tmp-claude-${process.pid}`);
+  const target = path.join(stateDir, 'terminal-provider-available.json');
+  const tmp = path.join(stateDir, `.tmp-terminal-provider-${process.pid}`);
   try {
     writeSecureFile(tmp, JSON.stringify(status, null, 2));
     fs.renameSync(tmp, target);
@@ -103,19 +190,19 @@ function writeClaudeAvailable(): void {
 }
 
 /**
- * System-prompt hint passed to claude via --append-system-prompt. Tells
- * claude what tab-awareness affordances exist in this session so it
+ * System-prompt hint passed to Claude via --append-system-prompt. Tells
+ * the agent what tab-awareness affordances exist in this session so it
  * doesn't have to discover them by trial. The user can override anything
  * here just by saying so — system prompt is a soft hint, not a contract.
  *
- * Two paths claude has:
+ * Two paths the agent has:
  *   1. Read live state from <stateDir>/tabs.json + active-tab.json
  *      (updated continuously by the gstack browser extension).
  *   2. Run $B tab, $B tabs, $B tab-each <command> to act on tabs. The
  *      tab-each helper fans a single command across every open tab and
  *      returns per-tab results as JSON.
  */
-function buildTabAwarenessHint(stateDir: string): string {
+function buildTabAwarenessHint(stateDir: string, providerLabel = 'the AI agent'): string {
   const tabsFile = path.join(stateDir, 'tabs.json');
   const activeFile = path.join(stateDir, 'active-tab.json');
   return [
@@ -137,19 +224,19 @@ function buildTabAwarenessHint(stateDir: string): string {
     '  $B tab-each text            — pull clean text from every tab',
     '  $B tab-each title           — list every tab\'s title',
     '',
-    'You\'re in a real terminal with a real PTY — slash commands, /resume, ANSI colors all work as in a normal claude session.',
+    `You\'re in a real terminal with a real PTY — interactive commands, ANSI colors, and the normal ${providerLabel} UI work as expected.`,
   ].join('\n');
 }
 
-/** Spawn claude in a PTY. Returns null if claude not on PATH. */
-function spawnClaude(cols: number, rows: number, onData: (chunk: Buffer) => void) {
-  const claudePath = findClaude();
-  if (!claudePath) return null;
+/** Spawn the selected provider in a PTY. Returns null if its command is unavailable. */
+function spawnProvider(cols: number, rows: number, onData: (chunk: Buffer) => void) {
+  const provider = providerSpec();
+  if (!commandAvailable(provider.command)) return null;
 
-  // Match phoenix env so claude knows which browse server to talk to and
+  // Match phoenix env so the provider knows which browse server to talk to and
   // doesn't try to autostart its own. BROWSE_HEADED=1 keeps the existing
-  // headed-mode browser; BROWSE_NO_AUTOSTART prevents claude's gstack
-  // tooling from racing to spawn another server.
+  // headed-mode browser; BROWSE_NO_AUTOSTART prevents gstack tooling from
+  // racing to spawn another server.
   const env: Record<string, string> = {
     ...process.env as any,
     BROWSE_PORT: String(BROWSE_SERVER_PORT),
@@ -160,15 +247,16 @@ function spawnClaude(cols: number, rows: number, onData: (chunk: Buffer) => void
     COLORTERM: 'truecolor',
   };
 
-  // --append-system-prompt is the right injection surface (per `claude --help`):
-  // it gets appended to the model's system prompt, so claude treats this as
-  // contextual guidance, not a user message. Don't use a leading PTY write
-  // for this — that would show up as if the user typed the hint, polluting
-  // the visible transcript.
+  // Claude has a clean system-prompt injection surface. Codex interactive
+  // currently runs without an injected hint; the same tab-state files remain
+  // available in the working environment and skills/docs point users there.
   const stateDir = path.dirname(STATE_FILE);
-  const tabHint = buildTabAwarenessHint(stateDir);
+  const tabHint = buildTabAwarenessHint(stateDir, provider.label);
+  const command = provider.id === 'claude'
+    ? [...provider.command, '--append-system-prompt', tabHint]
+    : provider.command;
 
-  const proc = (Bun as any).spawn([claudePath, '--append-system-prompt', tabHint], {
+  const proc = (Bun as any).spawn(command, {
     terminal: {
       rows,
       cols,
@@ -236,11 +324,20 @@ function buildServer() {
         }).catch(() => new Response('bad', { status: 400 }));
       }
 
-      // /claude-available — bootstrap card hits this when user clicks "I installed it".
-      if (url.pathname === '/claude-available' && req.method === 'GET') {
-        writeClaudeAvailable();
-        const found = findClaude();
-        return new Response(JSON.stringify({ available: !!found, path: found }), {
+      // /terminal-provider — bootstrap card probes the selected provider.
+      // /claude-available remains as a backwards-compatible alias for older
+      // extension builds.
+      if ((url.pathname === '/terminal-provider' || url.pathname === '/claude-available') && req.method === 'GET') {
+        writeProviderAvailable();
+        const provider = providerSpec();
+        const available = commandAvailable(provider.command);
+        return new Response(JSON.stringify({
+          provider: provider.id,
+          label: provider.label,
+          available,
+          path: available ? provider.command.join(' ') : undefined,
+          install_url: provider.installUrl,
+        }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -359,13 +456,14 @@ function buildServer() {
           return;
         }
 
-        // Binary input. Lazy-spawn claude on the first byte.
+        // Binary input. Lazy-spawn the selected provider on the first byte.
         if (!session.spawned) {
           session.spawned = true;
           // UTF-8 boundary detection to prevent splitting multi-byte characters (issue #1272).
           // Buffer incomplete UTF-8 sequences until the next chunk completes them.
           let leftover = Buffer.alloc(0);
-          const proc = spawnClaude(session.cols, session.rows, (chunk) => {
+          const provider = providerSpec();
+          const proc = spawnProvider(session.cols, session.rows, (chunk) => {
             const combined = Buffer.concat([leftover, Buffer.from(chunk)]);
             // Find the last index where a UTF-8 codepoint ends. Look back at most 3 bytes.
             let safeEnd = combined.length;
@@ -387,15 +485,17 @@ function buildServer() {
             try {
               ws.send(JSON.stringify({
                 type: 'error',
-                code: 'CLAUDE_NOT_FOUND',
-                message: 'claude CLI not on PATH. Install: https://docs.anthropic.com/en/docs/claude-code',
+                code: provider.notFoundCode,
+                provider: provider.id,
+                label: provider.label,
+                message: `${provider.label} command not available. Install: ${provider.installUrl}`,
               }));
-              ws.close(4404, 'claude not found');
+              ws.close(4404, 'provider not found');
             } catch {}
             return;
           }
           session.proc = proc;
-          // Watch for child exit so the WS closes cleanly when claude exits.
+          // Watch for child exit so the WS closes cleanly when the provider exits.
           proc.exited?.then?.(() => {
             try { ws.close(1000, 'pty exited'); } catch {}
           });
@@ -425,13 +525,13 @@ function buildServer() {
 }
 
 /**
- * Tab-switch helper: write the active tab to a state file (claude reads it)
+ * Tab-switch helper: write the active tab to a state file (the provider can read it)
  * and notify the parent server so its activeTabId stays synced. Skips
  * chrome:// and chrome-extension:// internal pages.
  */
 /**
  * Live tab snapshot. Writes <stateDir>/tabs.json (full list) and updates
- * <stateDir>/active-tab.json (current active). claude can read these any
+ * <stateDir>/active-tab.json (current active). The provider can read these any
  * time without invoking $B tabs — saves a round-trip when the model just
  * needs to check the landscape before deciding what to do.
  */
@@ -469,7 +569,7 @@ function handleTabState(msg: {
   }
 
   // active-tab.json — single active tab. Skip chrome-internal pages so
-  // claude doesn't see chrome:// or chrome-extension:// URLs as
+  // the provider doesn't see chrome:// or chrome-extension:// URLs as
   // "current target."
   const active = msg.active;
   if (active && active.url && !active.url.startsWith('chrome://') && !active.url.startsWith('chrome-extension://')) {
@@ -533,7 +633,7 @@ function readBrowseToken(): string {
 
 // Boot.
 function main() {
-  writeClaudeAvailable();
+  writeProviderAvailable();
   const server = buildServer();
   const port = (server as any).port || (server as any).address?.port;
   if (!port) {

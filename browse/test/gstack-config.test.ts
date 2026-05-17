@@ -41,10 +41,10 @@ afterEach(() => {
 
 describe('gstack-config', () => {
   // ─── get ──────────────────────────────────────────────────
-  test('get on missing file returns empty, exit 0', () => {
+  test('get on missing file returns known-key default, exit 0', () => {
     const { exitCode, stdout } = run(['get', 'auto_upgrade']);
     expect(exitCode).toBe(0);
-    expect(stdout).toBe('');
+    expect(stdout).toBe('false');
   });
 
   test('get existing key returns value', () => {
@@ -110,10 +110,11 @@ describe('gstack-config', () => {
     expect(stdout).toContain('update_check: false');
   });
 
-  test('list on missing file returns empty, exit 0', () => {
+  test('list on missing file returns active defaults, exit 0', () => {
     const { exitCode, stdout } = run(['list']);
     expect(exitCode).toBe(0);
-    expect(stdout).toBe('');
+    expect(stdout).toContain('Active values');
+    expect(stdout).toContain('auto_upgrade:');
   });
 
   // ─── usage ────────────────────────────────────────────────
@@ -147,6 +148,7 @@ describe('gstack-config', () => {
     expect(content).toContain('auto_upgrade:');
     expect(content).toContain('skill_prefix:');
     expect(content).toContain('routing_declined:');
+    expect(content).toContain('terminal_provider:');
     expect(content).toContain('codex_reviews:');
     expect(content).toContain('skip_eng_review:');
   });
@@ -176,9 +178,9 @@ describe('gstack-config', () => {
   });
 
   // ─── routing_declined ──────────────────────────────────────
-  test('routing_declined defaults to empty (not set)', () => {
+  test('routing_declined defaults to false', () => {
     const { stdout } = run(['get', 'routing_declined']);
-    expect(stdout).toBe('');
+    expect(stdout).toBe('false');
   });
 
   test('routing_declined can be set and read', () => {
@@ -192,5 +194,21 @@ describe('gstack-config', () => {
     run(['set', 'routing_declined', 'false']);
     const { stdout } = run(['get', 'routing_declined']);
     expect(stdout).toBe('false');
+  });
+
+  test('terminal_provider accepts claude and codex, rejects unknown values to claude', () => {
+    run(['set', 'terminal_provider', 'codex']);
+    expect(run(['get', 'terminal_provider']).stdout).toBe('codex');
+    run(['set', 'terminal_provider', 'claude']);
+    expect(run(['get', 'terminal_provider']).stdout).toBe('claude');
+    const bad = run(['set', 'terminal_provider', 'llama']);
+    expect(bad.stderr).toContain('terminal_provider');
+    expect(run(['get', 'terminal_provider']).stdout).toBe('claude');
+  });
+
+  test('codex_command preserves multi-word command values', () => {
+    run(['set', 'codex_command', 'npx -y @openai/codex']);
+    expect(run(['get', 'codex_command']).stdout).toBe('npx -y @openai/codex');
+    expect(run(['list']).stdout).toContain('codex_command:           npx -y @openai/codex (set)');
   });
 });

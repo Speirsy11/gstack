@@ -1,21 +1,21 @@
 /**
- * Terminal sidebar tab — interactive Claude Code PTY in xterm.js.
+ * Terminal sidebar tab — interactive AI coding PTY in xterm.js.
  *
  * Lifecycle (per plan + codex review):
  *   1. Sidebar opens. Terminal is the default-active tab.
- *   2. Bootstrap card shows "Press any key to start Claude Code."
+ *   2. Bootstrap card shows the selected provider startup status.
  *   3. On first keystroke (lazy spawn — codex finding #8): the extension
  *      a) POSTs /pty-session on the browse server with the AUTH_TOKEN to
  *         mint a short-lived HttpOnly cookie scoped to the terminal-agent.
  *      b) Opens ws://127.0.0.1:<terminalPort>/ws — the cookie travels
  *         automatically. Terminal-agent validates the cookie + the
  *         chrome-extension:// Origin (codex finding #9), then spawns
- *         claude in a PTY.
+ *         the selected provider in a PTY.
  *   4. Bytes pump both ways. Resize observer sends {type:"resize"} text
  *      frames; tab-switch hooks send {type:"tabSwitch"} frames.
  *   5. PTY exits or WS closes -> we show "Session ended" with a restart
  *      button. We do NOT auto-reconnect (codex finding #8: auto-reconnect
- *      = burn fresh claude session every time).
+ *      = burn a fresh provider session every time).
  *
  * Keep this file dependency-free. xterm.js + xterm-addon-fit are loaded
  * via <script src> tags in sidepanel.html (window.Terminal, window.FitAddon).
@@ -42,8 +42,9 @@
   };
 
   /** State machine. */
-  const STATE = { IDLE: 'idle', CONNECTING: 'connecting', LIVE: 'live', ENDED: 'ended', NO_CLAUDE: 'no-claude' };
+  const STATE = { IDLE: 'idle', CONNECTING: 'connecting', LIVE: 'live', ENDED: 'ended', NO_PROVIDER: 'no-provider' };
   let state = STATE.IDLE;
+  let providerInfo = { provider: 'claude', label: 'Claude Code', install_url: 'https://docs.anthropic.com/en/docs/claude-code' };
 
   let term = null;
   let fitAddon = null;
@@ -60,7 +61,7 @@
         hide(els.installCard);
         hide(els.mount);
         hide(els.ended);
-        els.bootstrapStatus.textContent = opts.message || 'Press any key to start Claude Code.';
+        els.bootstrapStatus.textContent = opts.message || `Starting ${providerInfo.label}...`;
         break;
       case STATE.CONNECTING:
         show(els.bootstrap);
@@ -81,7 +82,7 @@
         hide(els.mount);
         show(els.ended);
         break;
-      case STATE.NO_CLAUDE:
+      case STATE.NO_PROVIDER:
         show(els.bootstrap);
         show(els.installCard);
         hide(els.mount);
@@ -139,13 +140,15 @@
     }
   }
 
-  async function checkClaudeAvailable(terminalPort) {
+  async function checkProviderAvailable(terminalPort) {
     try {
-      const resp = await fetch(`http://127.0.0.1:${terminalPort}/claude-available`, {
+      const resp = await fetch(`http://127.0.0.1:${terminalPort}/terminal-provider`, {
         credentials: 'include',
       });
       if (!resp.ok) return { available: false };
-      return await resp.json();
+      const info = await resp.json();
+      providerInfo = { ...providerInfo, ...info };
+      return info;
     } catch {
       return { available: false };
     }
@@ -224,7 +227,7 @@
   /**
    * Inject a string into the live PTY (the same way a real keystroke would).
    * Used by the toolbar's Cleanup button and the Inspector's "Send to Code"
-   * action so the user can drive claude from outside-the-keyboard surfaces.
+   * action so the user can drive the provider from outside-the-keyboard surfaces.
    * Returns true if the bytes went out, false if no live session.
    */
   window.gstackInjectToTerminal = function (text) {
@@ -252,10 +255,10 @@
       return;
     }
 
-    // Pre-flight: does claude even exist on PATH?
-    const claudeStatus = await checkClaudeAvailable(terminalPort);
-    if (!claudeStatus.available) {
-      setState(STATE.NO_CLAUDE);
+    // Pre-flight: does the selected provider even exist on PATH?
+    const providerStatus = await checkProviderAvailable(terminalPort);
+    if (!providerStatus.available) {
+      setState(STATE.NO_PROVIDER);
       return;
     }
 
@@ -279,7 +282,7 @@
       try {
         ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
       } catch {}
-      // Push a fresh tab snapshot so claude's tabs.json is populated by
+      // Push a fresh tab snapshot so the provider's tabs.json is populated by
       // the time the lazy spawn finishes booting. Background.js exposes
       // the snapshot helper via chrome.runtime; we ask for it here and
       // forward whatever comes back.
@@ -297,7 +300,7 @@
           }
         });
       } catch {}
-      // Send a single byte to nudge the agent to spawn claude (lazy-spawn trigger).
+      // Send a single byte to nudge the agent to spawn the provider (lazy-spawn trigger).
       try { ws.send(new TextEncoder().encode('\n')); } catch {}
     });
 
@@ -306,8 +309,9 @@
         // Agent control message (rare). Treat as JSON; error frames carry code.
         try {
           const msg = JSON.parse(ev.data);
-          if (msg.type === 'error' && msg.code === 'CLAUDE_NOT_FOUND') {
-            setState(STATE.NO_CLAUDE);
+          if (msg.type === 'error' && (msg.code === 'CLAUDE_NOT_FOUND' || msg.code === 'CODEX_NOT_FOUND')) {
+            providerInfo = { ...providerInfo, ...msg };
+            setState(STATE.NO_PROVIDER);
             try { ws.close(); } catch {}
           }
         } catch {}
@@ -320,7 +324,7 @@
 
     ws.addEventListener('close', () => {
       ws = null;
-      if (state !== STATE.NO_CLAUDE) setState(STATE.ENDED);
+      if (state !== STATE.NO_PROVIDER) setState(STATE.ENDED);
     });
 
     ws.addEventListener('error', (err) => {
@@ -353,7 +357,7 @@
       term = null;
       fitAddon = null;
     }
-    setState(STATE.IDLE, { message: 'Starting Claude Code...' });
+    setState(STATE.IDLE, { message: `Starting ${providerInfo.label}...` });
     tryAutoConnect();
   }
 
@@ -375,11 +379,11 @@
   }
 
   function init() {
-    setState(STATE.IDLE, { message: 'Starting Claude Code...' });
+    setState(STATE.IDLE, { message: `Starting ${providerInfo.label}...` });
 
     els.installRetry?.addEventListener('click', () => {
-      // Re-probe claude on PATH, then try a connect.
-      setState(STATE.IDLE, { message: 'Starting Claude Code...' });
+      // Re-probe selected provider on PATH, then try a connect.
+      setState(STATE.IDLE, { message: `Starting ${providerInfo.label}...` });
       tryAutoConnect();
     });
 
@@ -387,14 +391,14 @@
     //   - els.restart lives inside the ENDED state card (visible only after
     //     a session has ended).
     //   - els.restartNow lives in the always-visible toolbar (lets the user
-    //     force a fresh claude mid-session without waiting for it to exit).
+    //     force a fresh provider session without waiting for it to exit).
     els.restart?.addEventListener('click', forceRestart);
     els.restartNow?.addEventListener('click', forceRestart);
 
 
     // Live browser-tab state. background.js → sidepanel.js → us. We
     // forward over the live PTY WebSocket; terminal-agent.ts writes
-    // <stateDir>/active-tab.json + <stateDir>/tabs.json so claude can
+    // <stateDir>/active-tab.json + <stateDir>/tabs.json so the provider can
     // always read the current tab landscape.
     document.addEventListener('gstack:tab-state', (ev) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
